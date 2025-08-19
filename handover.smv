@@ -1,0 +1,167 @@
+MODULE timer(start_flag, TIMEOUT)
+VAR
+  counter : 1..TIMEOUT;
+  expired : boolean;
+ASSIGN
+  init(counter) := 1;
+  init(expired) := FALSE;
+
+  next(counter) := 
+  case
+    !next(start_flag) : 1;
+    counter < TIMEOUT : counter + 1;
+    TRUE : counter;
+  esac;
+
+  next(expired) := next(counter) = TIMEOUT;
+
+MODULE uav(phase, msg)
+DEFINE
+  TIMEOUT := 5;
+
+VAR
+  RTB_flag : boolean;
+  state : {ST, WP, LO, HA, LA, PA, END, ERR};
+  ACK_timer : timer(msg = M_NONE,TIMEOUT);
+  
+ASSIGN
+  init(RTB_flag) := FALSE;
+  init(state) := ST;
+
+  next(RTB_flag) := next(ACK_timer.expired);
+  next(state) := 
+  case
+    state = ERR : ERR;
+    state = END : END;
+    next(RTB_flag) & state != LA : LA;
+    state = ST : WP;
+    state = LA : END;
+    state = PA : END;
+    next(msg) = M_NONE : state;
+    state = WP & next(msg) = M_WP : WP;
+    state = WP & next(msg) = M_LO : LO;
+    state = WP & next(msg) = M_LA : LA;
+    state = WP & next(msg) = M_PA : PA;
+    state = WP : ERR;
+    state = LO & next(msg) = M_LO : LO;
+    state = LO & next(msg) = M_WP : WP;
+    state = LO & next(msg) = M_HA : HA;
+    state = LO & next(msg) = M_LA : LA;
+    state = LO & next(msg) = M_PA : PA;
+    state = LO : ERR;
+    state = HA & next(msg) = M_WP : WP;
+    state = HA & next(msg) = M_HA : HA;
+    state = HA : ERR;
+  esac;
+
+MODULE pilot(PID, active, phase, succeed)
+DEFINE
+  TIMEOUT := 5;
+
+VAR
+  state : {CO_WP, CO_LO, RF, HR, HA, AL, PA, ID, END};
+  set_msg : {M_NONE, M_WP, M_LO, M_HA, M_LA, M_PA, EXC};
+
+  RF_start : boolean;
+  RF_timer : timer(RF_start,TIMEOUT);
+
+  HA_start : boolean;
+  HA_timer : timer(HA_start,TIMEOUT);
+
+ASSIGN
+  init(state) := PID = active ? CO_WP : ID;
+  init(set_msg) := M_NONE;
+  init(RF_start) := FALSE;
+  init(HA_start) := FALSE;
+
+
+  next(RF_start) := state = RF;
+  next(HA_start) := state = HA;
+  next(state) := 
+  case
+    next(phase) != PILOT : state;
+    state = CO_LO : {CO_LO, CO_WP, HA, AL, PA, RF};
+    state = CO_WP : {CO_LO, CO_WP, AL, PA, RF};
+    state = RF & next(RF_timer.expired) : {END};
+    state = RF : {CO_LO, CO_WP, RF};
+    state = HA & next(HA_timer.expired) : {CO_WP}; -- możliwe RF
+    state = HA & succeed : {ID};
+    state = HA : {HA};
+    state = ID : {ID, HR};
+    state = HR & succeed : {CO_WP};
+    state = HR : {HR, ID}; 
+    state = AL : {END};
+    state = PA : {END};
+    state = END : {END};
+  esac;
+  next(set_msg) := 
+  case
+    PID != next(active) : M_NONE;
+    next(state) = CO_LO : M_LO;
+    next(state) = CO_WP : M_WP;
+    next(state) = RF : M_NONE;
+    next(state) = HA : M_HA;
+    next(state) = AL : M_LA;
+    next(state) = PA : M_PA;
+    TRUE : EXC;
+  esac;
+
+-- TRANS PID = next(active) & next(state) = AL -> next(msg) = M_LA;
+-- TRANS PID = next(active) & next(state) = PA -> next(msg) = M_PA;
+-- TRANS PID = next(active) & next(state) = HA -> next(msg) = M_HA;
+-- TRANS PID = next(active) & next(state) = CO_LO -> next(msg) = M_LO;
+-- TRANS PID = next(active) & next(state) = CO_WP -> next(msg) = M_WP;
+-- TRANS PID = next(active) -> next(msg) = M_NONE;
+
+MODULE main
+DEFINE
+  succeed := phase = UAV & uav.state = HA & p1.state = HA & p2.state = HR;
+VAR
+  phase : {PILOT, UAV};
+  active : {P1, P2};
+  msg : {M_NONE, M_WP, M_LO, M_HA, M_LA, M_PA, EXC};
+  p1 : pilot(P1,active,phase,succeed);
+  p2 : pilot(P2,active,phase,succeed);
+  uav : uav(phase,msg);
+
+ASSIGN
+  init(phase) := UAV;
+  init(active) := P1;
+  init(msg) := M_NONE;
+
+
+  next(phase) :=
+  case
+    phase = PILOT : UAV;
+    phase = UAV : PILOT;
+  esac;
+
+  next(active) :=
+  case
+    succeed : active = P1 ? P2 : P1;
+    TRUE: active;    
+  esac;
+
+  next(msg) :=
+  case
+    active = P1 : next(p1.set_msg);
+    active = P2 : next(p2.set_msg);
+  esac;
+
+CTLSPEC AG EF (uav.state = END & (p1.state = END | p2.state = END))
+CTLSPEC AG EF ((p2.state != END -> EF active = P1) & (p1.state != END -> EF active = P2)) 
+CTLSPEC AG (msg = EXC -> (p1.state = END | p2.state = END))
+CTLSPEC AG uav.state != ERR;
+
+-- -- In all possible states, there is a future state 
+-- -- in which UAV and one of the pilots have finished.
+-- AG EF (uav.state = END & (p1.state = END | p2.state = END))
+-- -- In all possible states, the active pilot can be changed
+-- -- if the other pilot has not finished.
+-- AG EF ((p2.state != END -> EF active = P1) & 
+--        (p1.state != END -> EF active = P2)) 
+-- -- An exception message is sent only if one of the pilots ends.
+-- AG (msg = EXC -> (p1.state = END | p2.state = END))
+-- -- UVA is never in an error state.
+-- AG uav.state != ERR;
+
